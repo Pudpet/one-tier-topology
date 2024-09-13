@@ -1,0 +1,170 @@
+#include "ns3/mobility-module.h"
+#include "ns3/nstime.h"
+#include "ns3/core-module.h"
+#include "ns3/network-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/point-to-point-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/ipv4-global-routing-helper.h"
+#include "ns3/netanim-module.h"
+#include "ns3/flow-monitor.h"
+#include "ns3/flow-monitor-helper.h"
+#include "ns3/flow-monitor-module.h"
+
+#define TCP_SINK_PORT 9000
+#define UDP_SINK_PORT 9001
+
+// Experimental parameters
+#define MAX_BULK_BYTES 100000
+#define DDOS_RATE "1Mb/s"
+#define MAX_SIMULATION_TIME 1
+
+// Number of Bots for DDoS
+#define NUMBER_OF_BOTS 100
+#define NUMBER_OF_EXTRA_NODES 4  // จำนวนโหนด user ใหม่
+
+using namespace ns3;
+
+NS_LOG_COMPONENT_DEFINE("DDoSAttack");
+
+int main(int argc, char *argv[])
+{
+    CommandLine cmd;
+    cmd.Parse(argc, argv);
+
+    Time::SetResolution(Time::NS);
+    LogComponentEnable("UdpEchoClientApplication", LOG_LEVEL_INFO);
+    LogComponentEnable("UdpEchoServerApplication", LOG_LEVEL_INFO);
+
+    // Central node (acts as the server for all other nodes)
+    NodeContainer centralNode;
+    centralNode.Create(1);
+
+    // Legitimate connection nodes (3 nodes)
+    NodeContainer nodes;
+    nodes.Create(3);  // Three legitimate nodes
+
+    // Nodes for attack bots
+    NodeContainer botNodes;
+    botNodes.Create(NUMBER_OF_BOTS);
+
+    // Nodes for extra users
+    NodeContainer extraNodes;
+    extraNodes.Create(NUMBER_OF_EXTRA_NODES);  // Four extra nodes
+
+    // Define the Point-To-Point Links and their Parameters
+    PointToPointHelper p2p;
+    p2p.SetDeviceAttribute("DataRate", StringValue("10Mbps"));
+    p2p.SetChannelAttribute("Delay", StringValue("1ms"));
+
+    // Install the Point-To-Point Connections between all nodes and the central node
+    NetDeviceContainer centralToLegitDevices[3], centralToBotDevices[NUMBER_OF_BOTS], centralToExtraDevices[NUMBER_OF_EXTRA_NODES];
+
+    for (int i = 0; i < 3; ++i)
+    {
+        centralToLegitDevices[i] = p2p.Install(centralNode.Get(0), nodes.Get(i));
+    }
+
+    for (int i = 0; i < NUMBER_OF_BOTS; ++i)
+    {
+        centralToBotDevices[i] = p2p.Install(centralNode.Get(0), botNodes.Get(i));
+    }
+
+    for (int i = 0; i < NUMBER_OF_EXTRA_NODES; ++i)
+    {
+        centralToExtraDevices[i] = p2p.Install(centralNode.Get(0), extraNodes.Get(i));
+    }
+
+    // Enable packet capture for Wireshark
+    p2p.EnablePcapAll("traffic/traffic");
+
+    // Assign IP addresses to all nodes
+    InternetStackHelper stack;
+    stack.Install(centralNode);
+    stack.Install(nodes);
+    stack.Install(botNodes);
+    stack.Install(extraNodes);
+
+    Ipv4AddressHelper ipv4;
+    ipv4.SetBase("10.0.0.0", "255.255.255.0");
+
+    Ipv4InterfaceContainer centralInterfaces[3], botInterfaces[NUMBER_OF_BOTS], extraInterfaces[NUMBER_OF_EXTRA_NODES];
+
+    for (int i = 0; i < 3; ++i)
+    {
+        centralInterfaces[i] = ipv4.Assign(centralToLegitDevices[i]);
+        ipv4.NewNetwork();
+    }
+
+    for (int i = 0; i < NUMBER_OF_BOTS; ++i)
+    {
+        botInterfaces[i] = ipv4.Assign(centralToBotDevices[i]);
+        ipv4.NewNetwork();
+    }
+
+    for (int i = 0; i < NUMBER_OF_EXTRA_NODES; ++i)
+    {
+        extraInterfaces[i] = ipv4.Assign(centralToExtraDevices[i]);
+        ipv4.NewNetwork();
+    }
+
+    // DDoS Application Behavior
+    OnOffHelper onoff("ns3::UdpSocketFactory", Address(InetSocketAddress(centralInterfaces[0].GetAddress(1), UDP_SINK_PORT)));
+    onoff.SetConstantRate(DataRate(DDOS_RATE));
+    onoff.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=30]"));
+    onoff.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
+
+    ApplicationContainer onOffApp[NUMBER_OF_BOTS];
+
+    for (int i = 0; i < NUMBER_OF_BOTS; ++i)
+    {
+        onOffApp[i] = onoff.Install(botNodes.Get(i));
+        onOffApp[i].Start(Seconds(0.0));
+        onOffApp[i].Stop(Seconds(MAX_SIMULATION_TIME));
+    }
+
+    // Legitimate TCP traffic application (BulkSend) on legitimate nodes
+    BulkSendHelper bulkSend("ns3::TcpSocketFactory", InetSocketAddress(centralInterfaces[0].GetAddress(1), TCP_SINK_PORT));
+    bulkSend.SetAttribute("MaxBytes", UintegerValue(MAX_BULK_BYTES));
+    ApplicationContainer bulkSendApp = bulkSend.Install(nodes.Get(0));
+    bulkSendApp.Start(Seconds(0.0));
+    bulkSendApp.Stop(Seconds(MAX_SIMULATION_TIME));
+
+    // BulkSend on extra nodes to send TCP data
+    BulkSendHelper extraBulkSend("ns3::TcpSocketFactory", InetSocketAddress(centralInterfaces[0].GetAddress(1), TCP_SINK_PORT));
+    extraBulkSend.SetAttribute("MaxBytes", UintegerValue(MAX_BULK_BYTES));
+    ApplicationContainer extraBulkSendApp[NUMBER_OF_EXTRA_NODES];
+
+    for (int i = 0; i < NUMBER_OF_EXTRA_NODES; ++i)
+    {
+        extraBulkSendApp[i] = extraBulkSend.Install(extraNodes.Get(i));
+        extraBulkSendApp[i].Start(Seconds(0.0));
+        extraBulkSendApp[i].Stop(Seconds(MAX_SIMULATION_TIME));
+    }
+
+    // UDPSink on the central node
+    PacketSinkHelper UDPsink("ns3::UdpSocketFactory", Address(InetSocketAddress(Ipv4Address::GetAny(), UDP_SINK_PORT)));
+    ApplicationContainer UDPSinkApp = UDPsink.Install(centralNode.Get(0));
+    UDPSinkApp.Start(Seconds(0.0));
+    UDPSinkApp.Stop(Seconds(MAX_SIMULATION_TIME));
+
+    // TCP Sink Application on the central node
+    PacketSinkHelper TCPsink("ns3::TcpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), TCP_SINK_PORT));
+    ApplicationContainer TCPSinkApp = TCPsink.Install(centralNode.Get(0));
+    TCPSinkApp.Start(Seconds(0.0));
+    TCPSinkApp.Stop(Seconds(MAX_SIMULATION_TIME));
+
+    Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+
+    // Simulation NetAnim configuration and node placement
+    MobilityHelper mobility;
+    mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    mobility.Install(centralNode);
+    mobility.Install(nodes);
+    mobility.Install(botNodes);
+    mobility.Install(extraNodes);
+
+    AnimationInterface anim("DDoS-one-tier.xml");
+
+    // Set node icons and positions
+    uint32_t centralNodeIcon = anim.AddResource("ns-allin
